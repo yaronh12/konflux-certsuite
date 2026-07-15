@@ -756,7 +756,7 @@ spec:
 
           # ── Step 5: Push results to OCI registry ────────────────────
           - name: push-results
-            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            image: ghcr.io/oras-project/oras:v1.2.2
             onError: continue
             volumeMounts:
               - name: credentials
