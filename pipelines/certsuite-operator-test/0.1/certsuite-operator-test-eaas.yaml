@@ -801,9 +801,10 @@ spec:
               done
 
               echo "Pushing results to: ${OCI_REF}"
+              cd /tmp
               if oras push "${OCI_REF}" \
                 --artifact-type application/vnd.certsuite.results.v1+gzip \
-                /tmp/certsuite-results.tar.gz:application/gzip; then
+                certsuite-results.tar.gz:application/gzip; then
                 echo "Results pushed successfully"
                 echo ""
                 echo "Download results with:"
