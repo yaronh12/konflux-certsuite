@@ -767,55 +767,50 @@ spec:
               - name: SNAPSHOT
                 value: "$(params.fbcFragment)"
             script: |
-              #!/usr/bin/env bash
-              set -euo pipefail
+              #!/bin/sh
+              set -eu
 
               RESULTS_DIR="/workspace/results"
-              if [[ ! -d "${RESULTS_DIR}" ]] || ! ls "${RESULTS_DIR}"/*/claim.json &>/dev/null; then
-                echo "[$(date -u +%FT%T.%3NZ)] No certsuite results found. Skipping OCI push."
+              if [ ! -d "${RESULTS_DIR}" ] || ! ls "${RESULTS_DIR}"/*/claim.json >/dev/null 2>&1; then
+                echo "No certsuite results found. Skipping OCI push."
                 exit 0
               fi
 
-              # Derive OCI ref from the FBC fragment image
               IMAGE_REF=$(echo "${SNAPSHOT}" | cut -d'@' -f1)
-              if [[ -z "${IMAGE_REF}" || "${IMAGE_REF}" != *"quay.io"* ]]; then
-                echo "[$(date -u +%FT%T.%3NZ)] Cannot derive OCI ref from SNAPSHOT. Skipping."
+              if [ -z "${IMAGE_REF}" ]; then
+                echo "Cannot derive OCI ref from SNAPSHOT. Skipping."
                 exit 0
               fi
 
               OCI_TAG="certsuite-results-$(date -u +%Y%m%d-%H%M%S)"
               OCI_REF="${IMAGE_REF}:${OCI_TAG}"
 
-              echo "[$(date -u +%FT%T.%3NZ)] Packaging results..."
+              echo "Packaging results..."
               tar czf /tmp/certsuite-results.tar.gz -C /workspace results/
 
-              # Use the SA-mounted dockerconfig if available
-              DOCKER_CONFIG_PATHS=(
-                "/tekton/creds/.docker/config.json"
-                "${HOME}/.docker/config.json"
-                "/run/secrets/kubernetes.io/dockerconfig/config.json"
-              )
-              for CFG in "${DOCKER_CONFIG_PATHS[@]}"; do
-                if [[ -f "${CFG}" ]]; then
-                  echo "[$(date -u +%FT%T.%3NZ)] Using docker config: ${CFG}"
-                  export DOCKER_CONFIG="$(dirname "${CFG}")"
+              for CFG in \
+                /tekton/creds/.docker/config.json \
+                "${HOME}/.docker/config.json" \
+                /run/secrets/kubernetes.io/dockerconfig/config.json; do
+                if [ -f "${CFG}" ]; then
+                  echo "Using docker config: ${CFG}"
+                  DOCKER_CONFIG=$(dirname "${CFG}")
+                  export DOCKER_CONFIG
                   break
                 fi
               done
 
-              echo "[$(date -u +%FT%T.%3NZ)] Pushing results to: ${OCI_REF}"
+              echo "Pushing results to: ${OCI_REF}"
               if oras push "${OCI_REF}" \
                 --artifact-type application/vnd.certsuite.results.v1+gzip \
                 /tmp/certsuite-results.tar.gz:application/gzip; then
-                echo "[$(date -u +%FT%T.%3NZ)] Results pushed successfully"
+                echo "Results pushed successfully"
                 echo ""
-                echo "════════════════════════════════════════════════════"
-                echo " Download results with:"
-                echo "   oras pull ${OCI_REF}"
-                echo "   tar xzf certsuite-results.tar.gz"
-                echo "════════════════════════════════════════════════════"
+                echo "Download results with:"
+                echo "  oras pull ${OCI_REF}"
+                echo "  tar xzf certsuite-results.tar.gz"
               else
-                echo "[$(date -u +%FT%T.%3NZ)] WARNING: OCI push failed (non-fatal)"
+                echo "WARNING: OCI push failed (non-fatal)"
               fi
 
     # Results are printed in the run-certsuite step and pushed to OCI
