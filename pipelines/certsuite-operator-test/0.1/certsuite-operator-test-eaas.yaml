@@ -754,7 +754,70 @@ spec:
                 echo "[$(date -u +%FT%T.%3NZ)] ${SUITE}: total=${TOTAL} passed=${PASSED} failed=${FAILED}"
               done
 
-    # Results are printed in the deploy-and-test step's certsuite summary.
-    # TODO: Add collect-results as a step inside deploy-and-test when
-    # cert-track and OCI push are needed (Konflux IntegrationTestScenarios
-    # do not provide pipeline-level workspace bindings).
+          # ── Step 5: Push results to OCI registry ────────────────────
+          - name: push-results
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            onError: continue
+            volumeMounts:
+              - name: credentials
+                mountPath: /credentials
+            env:
+              - name: KUBECONFIG
+                value: "/credentials/$(steps.get-kubeconfig.results.kubeconfig)"
+              - name: SNAPSHOT
+                value: "$(params.fbcFragment)"
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              RESULTS_DIR="/workspace/results"
+              if [[ ! -d "${RESULTS_DIR}" ]] || ! ls "${RESULTS_DIR}"/*/claim.json &>/dev/null; then
+                echo "[$(date -u +%FT%T.%3NZ)] No certsuite results found. Skipping OCI push."
+                exit 0
+              fi
+
+              # Derive OCI ref from the FBC fragment image
+              IMAGE_REF=$(echo "${SNAPSHOT}" | cut -d'@' -f1)
+              if [[ -z "${IMAGE_REF}" || "${IMAGE_REF}" != *"quay.io"* ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] Cannot derive OCI ref from SNAPSHOT. Skipping."
+                exit 0
+              fi
+
+              OCI_TAG="certsuite-results-$(date -u +%Y%m%d-%H%M%S)"
+              OCI_REF="${IMAGE_REF}:${OCI_TAG}"
+
+              echo "[$(date -u +%FT%T.%3NZ)] Packaging results..."
+              tar czf /tmp/certsuite-results.tar.gz -C /workspace results/
+
+              # Use the SA-mounted dockerconfig if available
+              DOCKER_CONFIG_PATHS=(
+                "/tekton/creds/.docker/config.json"
+                "${HOME}/.docker/config.json"
+                "/run/secrets/kubernetes.io/dockerconfig/config.json"
+              )
+              for CFG in "${DOCKER_CONFIG_PATHS[@]}"; do
+                if [[ -f "${CFG}" ]]; then
+                  echo "[$(date -u +%FT%T.%3NZ)] Using docker config: ${CFG}"
+                  export DOCKER_CONFIG="$(dirname "${CFG}")"
+                  break
+                fi
+              done
+
+              echo "[$(date -u +%FT%T.%3NZ)] Pushing results to: ${OCI_REF}"
+              if oras push "${OCI_REF}" \
+                --artifact-type application/vnd.certsuite.results.v1+gzip \
+                /tmp/certsuite-results.tar.gz:application/gzip; then
+                echo "[$(date -u +%FT%T.%3NZ)] Results pushed successfully"
+                echo ""
+                echo "════════════════════════════════════════════════════"
+                echo " Download results with:"
+                echo "   oras pull ${OCI_REF}"
+                echo "   tar xzf certsuite-results.tar.gz"
+                echo "════════════════════════════════════════════════════"
+              else
+                echo "[$(date -u +%FT%T.%3NZ)] WARNING: OCI push failed (non-fatal)"
+              fi
+
+    # Results are printed in the run-certsuite step and pushed to OCI
+    # in the push-results step. Download with:
+    #   oras pull <OCI_REF printed in push-results logs>
