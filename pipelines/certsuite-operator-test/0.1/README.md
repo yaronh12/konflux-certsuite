@@ -18,13 +18,22 @@ cluster is automatically destroyed when the PipelineRun completes.
 2. `provision-eaas-space` -- allocate EaaS space
 3. `get-unreleased-bundle` -- get operator bundle from FBC
 4. `pick-cluster-params` -- select OCP version and architecture
-5. `provision-cluster` -- create ephemeral Hypershift cluster
-6. `deploy-and-test` -- get kubeconfig, deploy operator + operands, run certsuite
-7. `collect-results` -- optionally push to cert-track-results / OCI
+5. `provision-cluster` -- render FBC/bundle, match `registry.redhat.io`
+   digests to `COMPONENT_REPOS` on quay → pass as Hypershift
+   `imageContentSources` → create ephemeral cluster (HCCO applies a managed
+   IDMS so pulls redirect to quay.io)
+6. `deploy-and-test` -- standard CatalogSource from FBC image, OLM install,
+   Hypershift CSV fixes (`minKubeVersion` / master `nodeSelector`), operands,
+   certsuite
 
 ### Minimum Parameters
 
-Only `TEST_BUNDLE_REF` is required. Everything else has defaults.
+- `TEST_BUNDLE_REF` — always required
+- `COMPONENT_REPOS` — required for **unreleased** operators (images only on
+  `quay.io/redhat-user-workloads`). Comma-separated quay repo names under the
+  FBC tenant, e.g.
+  `ptp-operator-mono-4-22,linuxptp-daemon-mono-4-22,cloud-event-proxy-mono-4-22,ptp-must-gather-mono-4-22`.
+  Omit for released operators on `registry.redhat.io`.
 
 ## Shared Cluster Variant
 

@@ -19,10 +19,18 @@ spec:
   params:
     - name: TEST_BUNDLE_REF
       value: "https://github.com/<REPLACE:org>/<REPLACE:repo>.git#certsuite-test-bundle"
-    # All other params are optional with sensible defaults:
-    # - CERTSUITE_LABELS: empty = run all tests
-    # - CERT_TRACK_URL: empty = skip cert-track upload
-    # - OCI_REF: empty = skip OCI push
+    # Required for unreleased operators (images only on quay.io, not registry.redhat.io).
+    # Quay repo names under the same redhat-user-workloads tenant as the FBC.
+    # The pipeline matches registry.redhat.io digests to these repos and passes
+    # the result as Hypershift imageContentSources at cluster provision time.
+    - name: COMPONENT_REPOS
+      value: "<REPLACE:repo1>,<REPLACE:repo2>,<REPLACE:repo3>"
+    # Example for PTP 4.22:
+    #   ptp-operator-mono-4-22,linuxptp-daemon-mono-4-22,cloud-event-proxy-mono-4-22,ptp-must-gather-mono-4-22
+    # Optional:
+    # - CERTSUITE_LABELS: default "common"
+    # - PACKAGE_NAME / CHANNEL_NAME: auto-detected from FBC when empty
+    # - OCI_PUSH_SECRET: Quay push secret for certsuite results
   resolverRef:
     resolver: git
     params:

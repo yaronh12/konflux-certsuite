@@ -38,6 +38,23 @@ spec:
     - name: CHANNEL_NAME
       type: string
       default: ""
+    - name: COMPONENT_REPOS
+      type: string
+      default: ""
+      description: |
+        Comma-separated quay.io repository names (under the same
+        redhat-user-workloads tenant as the FBC) used to build Hypershift
+        imageContentSources for unreleased operators.
+
+        The pipeline renders the FBC/bundle, collects registry.redhat.io@digest
+        references, and matches each digest against these repos (plus the
+        auto-derived bundle repo and origin-kube-rbac-proxy). Digests match
+        across registries; only the path differs.
+
+        Example (PTP 4.22):
+          ptp-operator-mono-4-22,linuxptp-daemon-mono-4-22,cloud-event-proxy-mono-4-22,ptp-must-gather-mono-4-22
+
+        Leave empty for released operators that pull from registry.redhat.io.
     - name: OCI_PUSH_SECRET
       type: string
       default: "imagerepository-ptp-operator-fbc-4-22-image-push"
@@ -173,10 +190,16 @@ spec:
                 - name: pathInRepo
                   value: stepactions/bundles/pick-cluster-arch/0.1/pick-cluster-arch.yaml
             params:
+              # Must be the operator bundle, not the FBC fragment — arch labels
+              # live on the CSV inside the bundle. Passing FBC causes jq null errors.
               - name: bundleImage
-                value: "$(tasks.parse-metadata.results.component-container-image)"
+                value: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
 
     # ── 5. Provision Ephemeral Cluster ─────────────────────────────────
+    # Note: do not gate on ocpVersion/bundleArch results. Those StepAction
+    # results sometimes do not surface on the TaskRun, which makes Tekton
+    # treat them as "" and silently skip this task (PipelineRun still Succeeded).
+    # pick-cluster-params already succeeded if we got here; fail loudly instead.
     - name: provision-cluster
       runAfter:
         - pick-cluster-params
@@ -184,16 +207,27 @@ spec:
         - input: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
           operator: notin
           values: [""]
-        - input: "$(tasks.pick-cluster-params.results.ocpVersion)"
-          operator: notin
-          values: [""]
-        - input: "$(tasks.pick-cluster-params.results.bundleArch)"
-          operator: notin
-          values: [""]
+      params:
+        - name: fbcFragment
+          value: "$(tasks.parse-metadata.results.component-container-image)"
+        - name: bundleImage
+          value: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
+        - name: componentRepos
+          value: $(params.COMPONENT_REPOS)
       taskSpec:
+        params:
+          - name: fbcFragment
+            type: string
+          - name: bundleImage
+            type: string
+          - name: componentRepos
+            type: string
         results:
           - name: clusterName
             value: "$(steps.create-cluster.results.clusterName)"
+        volumes:
+          - name: ics-data
+            emptyDir: {}
         steps:
           - name: get-latest-version-tag
             ref:
@@ -208,6 +242,159 @@ spec:
             params:
               - name: prefix
                 value: "$(tasks.pick-cluster-params.results.ocpVersion)"
+
+          # Build Hypershift imageContentSources from FBC + bundle:
+          # collect registry.redhat.io@digest refs, match digests to quay repos.
+          # HCCO turns this into a managed IDMS (bypasses guest ValidatingAdmissionPolicy).
+          - name: build-image-content-sources
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            computeResources:
+              limits:
+                memory: 8Gi
+              requests:
+                memory: 4Gi
+                cpu: "1"
+            env:
+              - name: FBC_FRAGMENT
+                value: "$(params.fbcFragment)"
+              - name: BUNDLE_IMAGE
+                value: "$(params.bundleImage)"
+              - name: COMPONENT_REPOS
+                value: "$(params.componentRepos)"
+            volumeMounts:
+              - name: ics-data
+                mountPath: /ics
+            results:
+              - name: imageContentSourcesFile
+                type: string
+                description: Path to ICS YAML for create-cluster (empty when unused)
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              RESULT_PATH="$(results.imageContentSourcesFile.path)"
+              ICS_OUT="/ics/image-content-sources.yaml"
+
+              # Released / non-Konflux FBC: nothing to mirror
+              if [[ "${FBC_FRAGMENT}" != quay.io/redhat-user-workloads/* ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] FBC is not on redhat-user-workloads; skipping imageContentSources"
+                echo -n "" > "${RESULT_PATH}"
+                exit 0
+              fi
+
+              FBC_BASE="${FBC_FRAGMENT%%@*}"
+              TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
+              TENANT="${TENANT_AND_REPO%%/*}"
+              FBC_REPO="${TENANT_AND_REPO#*/}"
+              echo "[$(date -u +%FT%T.%3NZ)] Tenant=${TENANT} FBC repo=${FBC_REPO}"
+
+              echo "[$(date -u +%FT%T.%3NZ)] Rendering FBC..."
+              opm render "${FBC_FRAGMENT}" > /tmp/fbc.json
+
+              ORIG_BUNDLE_IMG=$(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)
+              if [[ -z "${ORIG_BUNDLE_IMG}" || "${ORIG_BUNDLE_IMG}" == "null" ]]; then
+                echo "ERROR: No olm.bundle image in FBC" >&2
+                exit 1
+              fi
+              echo "[$(date -u +%FT%T.%3NZ)] Catalog bundle image: ${ORIG_BUNDLE_IMG}"
+
+              # Resolve quay bundle (same digest, Konflux naming)
+              BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
+              [[ "${BUNDLE_DIGEST}" == "${BUNDLE_IMAGE}" ]] && BUNDLE_DIGEST="${ORIG_BUNDLE_IMG##*@}"
+              BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
+              QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
+              if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
+                BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
+                QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
+                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
+                  { echo "ERROR: Cannot resolve quay bundle for digest ${BUNDLE_DIGEST}" >&2; exit 1; }
+              fi
+              echo "[$(date -u +%FT%T.%3NZ)] Quay bundle: ${QUAY_BUNDLE}"
+
+              # Candidate quay repos: COMPONENT_REPOS + derived bundle repo
+              CANDIDATES=()
+              if [[ -n "${COMPONENT_REPOS}" ]]; then
+                IFS=',' read -ra _repos <<< "${COMPONENT_REPOS}"
+                for r in "${_repos[@]}"; do
+                  r=$(echo "${r}" | xargs)
+                  [[ -n "${r}" ]] && CANDIDATES+=("${r}")
+                done
+              fi
+              CANDIDATES+=("${BUNDLE_REPO}")
+
+              echo "[$(date -u +%FT%T.%3NZ)] Rendering quay bundle for related images..."
+              opm render "${QUAY_BUNDLE}" > /tmp/bundle.json
+
+              # All registry.redhat.io@sha256 refs from FBC + bundle
+              {
+                jq -r '.. | strings | select(test("registry\\.redhat\\.io/.+@sha256:[a-f0-9]+"))' /tmp/fbc.json
+                jq -r '.. | strings | select(test("registry\\.redhat\\.io/.+@sha256:[a-f0-9]+"))' /tmp/bundle.json
+                echo "${ORIG_BUNDLE_IMG}"
+              } | grep -E '^registry\.redhat\.io/' | sort -u > /tmp/redhat-images.txt
+
+              if [[ ! -s /tmp/redhat-images.txt ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] No registry.redhat.io digest refs; skipping imageContentSources"
+                echo -n "" > "${RESULT_PATH}"
+                exit 0
+              fi
+
+              echo "[$(date -u +%FT%T.%3NZ)] Matching digests to quay mirrors..."
+              : > "${ICS_OUT}"
+              : > /tmp/seen-sources.txt
+              UNMATCHED=()
+
+              while IFS= read -r IMG; do
+                [[ -z "${IMG}" ]] && continue
+                DIGEST="${IMG##*@}"
+                SOURCE="${IMG%@*}"
+                SOURCE="${SOURCE%%:*}"  # drop any tag if present before @
+
+                # One ICS entry per source repository
+                grep -qxF "${SOURCE}" /tmp/seen-sources.txt && continue
+
+                MIRROR=""
+                if [[ "${SOURCE}" == *kube-rbac-proxy* ]]; then
+                  if skopeo inspect --raw "docker://quay.io/openshift/origin-kube-rbac-proxy@${DIGEST}" &>/dev/null; then
+                    MIRROR="quay.io/openshift/origin-kube-rbac-proxy"
+                  fi
+                fi
+                if [[ -z "${MIRROR}" ]]; then
+                  for REPO in "${CANDIDATES[@]}"; do
+                    CAND="quay.io/redhat-user-workloads/${TENANT}/${REPO}"
+                    if skopeo inspect --raw "docker://${CAND}@${DIGEST}" &>/dev/null; then
+                      MIRROR="${CAND}"
+                      break
+                    fi
+                  done
+                fi
+
+                if [[ -z "${MIRROR}" ]]; then
+                  UNMATCHED+=("${IMG}")
+                  continue
+                fi
+
+                echo "${SOURCE}" >> /tmp/seen-sources.txt
+                echo "[$(date -u +%FT%T.%3NZ)]   ${SOURCE} -> ${MIRROR}"
+                printf '%s\n' "- source: ${SOURCE}" "  mirrors:" "    - ${MIRROR}" >> "${ICS_OUT}"
+              done < /tmp/redhat-images.txt
+
+              if [[ ${#UNMATCHED[@]} -gt 0 ]]; then
+                echo "ERROR: Could not find quay mirrors for:" >&2
+                printf '  %s\n' "${UNMATCHED[@]}" >&2
+                echo "Pass COMPONENT_REPOS with the tenant quay repo names that hold these digests." >&2
+                echo "Candidates tried: ${CANDIDATES[*]}" >&2
+                exit 1
+              fi
+
+              if [[ ! -s "${ICS_OUT}" ]]; then
+                echo "ERROR: Built empty imageContentSources" >&2
+                exit 1
+              fi
+
+              echo "[$(date -u +%FT%T.%3NZ)] Built imageContentSources:"
+              cat "${ICS_OUT}"
+              echo -n "${ICS_OUT}" > "${RESULT_PATH}"
+
           - name: create-cluster
             ref:
               resolver: git
@@ -218,6 +405,9 @@ spec:
                   value: main
                 - name: pathInRepo
                   value: stepactions/eaas-create-ephemeral-cluster-hypershift-aws/0.1/eaas-create-ephemeral-cluster-hypershift-aws.yaml
+            volumeMounts:
+              - name: ics-data
+                mountPath: /ics
             params:
               - name: eaasSpaceSecretRef
                 value: $(tasks.provision-eaas-space.results.secretRef)
@@ -225,6 +415,8 @@ spec:
                 value: "$(steps.get-latest-version-tag.results.version)"
               - name: instanceType
                 value: "$(tasks.pick-cluster-params.results.bundleArch)"
+              - name: imageContentSourcesFile
+                value: "$(steps.build-image-content-sources.results.imageContentSourcesFile)"
 
     # ── 6. Deploy Operator + Operands + Run Certsuite ──────────────────
     - name: deploy-and-test
@@ -343,35 +535,34 @@ spec:
                 sleep 5
               done
 
-              # ── Render FBC and patch bundle image to quay.io ────────────────
+              # ── Verify Hypershift-managed IDMS (from imageContentSources) ───
+              echo "[$(date -u +%FT%T.%3NZ)] Checking ImageDigestMirrorSet on guest cluster..."
+              for i in $(seq 1 30); do
+                IDMS_COUNT=$(oc get imagedigestmirrorset -o name 2>/dev/null | wc -l | tr -d ' ')
+                if [[ "${IDMS_COUNT}" -gt 0 ]]; then
+                  echo "[$(date -u +%FT%T.%3NZ)] Found ${IDMS_COUNT} ImageDigestMirrorSet(s):"
+                  oc get imagedigestmirrorset -o yaml | jq -r '
+                    .items[]? |
+                    "  \(.metadata.name): " +
+                    ([.spec.imageDigestMirrors[]? | "\(.source) -> \(.mirrors[0])"] | join("; "))
+                  ' 2>/dev/null || oc get imagedigestmirrorset
+                  break
+                fi
+                if [[ ${i} -eq 30 ]]; then
+                  echo "[$(date -u +%FT%T.%3NZ)] WARNING: No IDMS found. Unreleased registry.redhat.io pulls may fail."
+                  echo "  Ensure COMPONENT_REPOS was set and ClusterTemplate supports imageContentSources."
+                fi
+                sleep 5
+              done
+
+              # ── Render FBC for package/bundle metadata (no image patching) ──
               echo "[$(date -u +%FT%T.%3NZ)] Rendering FBC fragment..."
               opm render "${FBC_FRAGMENT}" > /tmp/fbc.json
 
               BUNDLE_NAME=$(jq -r 'select(.schema == "olm.bundle") | .name' /tmp/fbc.json | head -1)
               echo "[$(date -u +%FT%T.%3NZ)] Bundle name: ${BUNDLE_NAME}"
-
-              ORIG_BUNDLE_IMG=$(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)
-              echo "[$(date -u +%FT%T.%3NZ)] Original bundle image: ${ORIG_BUNDLE_IMG}"
-
-              BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
-              FBC_BASE="${FBC_FRAGMENT%%@*}"
-              TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
-              TENANT="${TENANT_AND_REPO%%/*}"
-              FBC_REPO="${TENANT_AND_REPO#*/}"
-              BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
-              QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
-
-              echo "[$(date -u +%FT%T.%3NZ)] Trying quay.io bundle: ${QUAY_BUNDLE}"
-              if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
-                BUNDLE_REPO2=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
-                QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO2}@${BUNDLE_DIGEST}"
-                echo "[$(date -u +%FT%T.%3NZ)] Trying fallback: ${QUAY_BUNDLE}"
-                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
-                  { echo "ERROR: Cannot resolve bundle at quay.io"; exit 1; }
-              fi
-              echo "[$(date -u +%FT%T.%3NZ)] Resolved quay.io bundle: ${QUAY_BUNDLE}"
-
-              sed "s|${ORIG_BUNDLE_IMG}|${QUAY_BUNDLE}|g" /tmp/fbc.json > /tmp/fbc-patched.json
+              echo "[$(date -u +%FT%T.%3NZ)] Bundle image (via IDMS): $(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)"
+              echo "[$(date -u +%FT%T.%3NZ)] Unreleased bundle result: ${BUNDLE_IMAGE}"
 
               # ── Determine install namespace from FBC metadata ────────────────
               INSTALL_NAMESPACE=$(jq -r 'select(.schema == "olm.bundle") | .properties[]? |
@@ -408,77 +599,10 @@ spec:
               OG_EOF
               fi
 
-              # ── Deploy patched FBC via ConfigMap + opm serve ────────────────
-              echo "[$(date -u +%FT%T.%3NZ)] Creating patched FBC catalog..."
-              oc create configmap patched-fbc-catalog \
-                --from-file=catalog.json=/tmp/fbc-patched.json \
-                -n "${INSTALL_NAMESPACE}"
-
-              oc apply -f - <<SERVE_EOF
-              apiVersion: apps/v1
-              kind: Deployment
-              metadata:
-                name: patched-fbc-server
-                namespace: ${INSTALL_NAMESPACE}
-              spec:
-                replicas: 1
-                selector:
-                  matchLabels:
-                    app: patched-fbc-server
-                template:
-                  metadata:
-                    labels:
-                      app: patched-fbc-server
-                  spec:
-                    containers:
-                      - name: opm
-                        image: ${FBC_FRAGMENT}
-                        command: ["/bin/opm", "serve", "/catalog"]
-                        ports:
-                          - containerPort: 50051
-                            name: grpc
-                        volumeMounts:
-                          - name: catalog
-                            mountPath: /catalog/catalog.json
-                            subPath: catalog.json
-                        readinessProbe:
-                          exec:
-                            command: ["/bin/grpc_health_probe", "-addr=:50051"]
-                          initialDelaySeconds: 5
-                          periodSeconds: 10
-                    volumes:
-                      - name: catalog
-                        configMap:
-                          name: patched-fbc-catalog
-              ---
-              apiVersion: v1
-              kind: Service
-              metadata:
-                name: patched-fbc-server
-                namespace: ${INSTALL_NAMESPACE}
-              spec:
-                selector:
-                  app: patched-fbc-server
-                ports:
-                  - port: 50051
-                    targetPort: 50051
-                    protocol: TCP
-              SERVE_EOF
-
-              echo "[$(date -u +%FT%T.%3NZ)] Waiting for catalog server..."
-              if ! oc rollout status deployment/patched-fbc-server -n "${INSTALL_NAMESPACE}" --timeout=300s; then
-                echo "ERROR: catalog server rollout failed. Diagnosing..."
-                oc get pods -n "${INSTALL_NAMESPACE}" -l app=patched-fbc-server -o wide 2>&1 || true
-                POD=$(oc get pods -n "${INSTALL_NAMESPACE}" -l app=patched-fbc-server \
-                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-                if [[ -n "${POD}" ]]; then
-                  oc describe pod "${POD}" -n "${INSTALL_NAMESPACE}" 2>&1 | tail -30 || true
-                  oc logs "${POD}" -n "${INSTALL_NAMESPACE}" --tail=20 2>&1 || true
-                fi
-                exit 1
-              fi
-
-              # ── CatalogSource pointing to patched server ─────────────────────
+              # ── CatalogSource from FBC fragment image (quay.io) ───────────────
+              # Bundle/operator images still reference registry.redhat.io in the
+              # catalog/CSV; Hypershift IDMS (from imageContentSources) redirects
+              # those pulls to quay.io transparently.
               CATSRC=$(oc create -f - -o jsonpath='{.metadata.name}' <<CS_EOF
               apiVersion: operators.coreos.com/v1alpha1
               kind: CatalogSource
@@ -487,22 +611,28 @@ spec:
                 namespace: ${INSTALL_NAMESPACE}
               spec:
                 sourceType: grpc
-                address: "patched-fbc-server.${INSTALL_NAMESPACE}.svc:50051"
-                displayName: "Certsuite Test Catalog (patched)"
+                image: ${FBC_FRAGMENT}
+                displayName: "Certsuite Test Catalog"
                 publisher: "konflux-certsuite"
               CS_EOF
               )
 
+              echo "[$(date -u +%FT%T.%3NZ)] Waiting for CatalogSource ${CATSRC}..."
               for i in $(seq 1 60); do
                 STATE=$(oc get catalogsource "${CATSRC}" -n "${INSTALL_NAMESPACE}" \
                   -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
                 [[ "${STATE}" == "READY" ]] && break
-                [[ ${i} -eq 60 ]] && { echo "ERROR: CatalogSource not ready"; exit 1; }
+                [[ ${i} -eq 60 ]] && {
+                  echo "ERROR: CatalogSource not ready" >&2
+                  oc get catalogsource "${CATSRC}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
+                  oc get pods -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
+                  exit 1
+                }
                 sleep 10
               done
               echo "[$(date -u +%FT%T.%3NZ)] CatalogSource ${CATSRC} READY"
 
-              # ── Subscription ─────────────────────────────────────────────────
+              # ── Subscription (Manual so we can patch Hypershift CSV constraints)
               SUB=$(oc create -f - -o jsonpath='{.metadata.name}' <<SUB_EOF
               apiVersion: operators.coreos.com/v1alpha1
               kind: Subscription
@@ -519,7 +649,6 @@ spec:
               SUB_EOF
               )
 
-              # Wait for InstallPlan, then approve it
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for InstallPlan..."
               IP=""
               for i in $(seq 1 60); do
@@ -537,48 +666,36 @@ spec:
               oc patch installplan "${IP}" -n "${INSTALL_NAMESPACE}" \
                 --type merge -p '{"spec":{"approved":true}}' 2>&1
 
-              # Wait for OLM to create CSV
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for OLM to create CSV..."
               CSV=""
               for i in $(seq 1 60); do
                 CSV=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
                   -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
                 [[ -n "${CSV}" ]] && break
+                # installedCSV may lag; the CSV often appears as startingCSV first
+                if oc get csv "${BUNDLE_NAME}" -n "${INSTALL_NAMESPACE}" &>/dev/null; then
+                  CSV="${BUNDLE_NAME}"
+                  break
+                fi
                 sleep 5
               done
               if [[ -z "${CSV}" ]]; then
                 echo "ERROR: OLM did not create CSV" >&2
                 oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
+                oc get installplan "${IP}" -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
                 exit 1
               fi
               echo "[$(date -u +%FT%T.%3NZ)] CSV created: ${CSV}"
 
-              # Patch CSV for Hypershift compatibility + image references
-              echo "[$(date -u +%FT%T.%3NZ)] Patching CSV for Hypershift..."
+              # Hypershift-only CSV fixes (not image-related — IDMS handles pulls)
+              echo "[$(date -u +%FT%T.%3NZ)] Patching CSV for Hypershift constraints..."
               CSV_JSON=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o json)
-
-              REDHAT_IMGS=$(echo "${CSV_JSON}" | grep -o 'registry\.redhat\.io[^"]*' | sort -u || true)
-              if [[ -n "${REDHAT_IMGS}" ]]; then
-                echo "[$(date -u +%FT%T.%3NZ)] Found registry.redhat.io references in CSV, patching..."
-                echo "${REDHAT_IMGS}"
-                CSV_STR=$(echo "${CSV_JSON}")
-                CSV_STR=$(echo "${CSV_STR}" | sed 's|registry\.redhat\.io/openshift4/ptp-rhel9-operator|quay.io/redhat-user-workloads/experimental-ptp-tenant/ptp-operator-mono-4-22|g')
-                CSV_STR=$(echo "${CSV_STR}" | sed 's|registry\.redhat\.io/openshift4/ptp-rhel9|quay.io/redhat-user-workloads/experimental-ptp-tenant/linuxptp-daemon-mono-4-22|g')
-                CSV_STR=$(echo "${CSV_STR}" | sed 's|registry\.redhat\.io/openshift4/cloud-event-proxy-rhel9|quay.io/redhat-user-workloads/experimental-ptp-tenant/cloud-event-proxy-mono-4-22|g')
-                CSV_STR=$(echo "${CSV_STR}" | sed 's|registry\.redhat\.io/openshift4/ose-kube-rbac-proxy-rhel9|quay.io/openshift/origin-kube-rbac-proxy|g')
-                CSV_STR=$(echo "${CSV_STR}" | sed 's|registry\.redhat\.io/openshift4/ptp-operator-must-gather|quay.io/redhat-user-workloads/experimental-ptp-tenant/ptp-must-gather-mono-4-22|g')
-                CSV_JSON=$(echo "${CSV_STR}")
-              else
-                echo "[$(date -u +%FT%T.%3NZ)] No registry.redhat.io references in CSV"
-              fi
-
               CSV_JSON=$(echo "${CSV_JSON}" | jq 'del(.spec.minKubeVersion)')
               CSV_JSON=$(echo "${CSV_JSON}" | jq '
                 (.spec.install.spec.deployments[]?.spec.template.spec.nodeSelector) |=
                   (if . then del(.["node-role.kubernetes.io/master"]) else . end)')
               echo "${CSV_JSON}" | oc replace -f - 2>&1
 
-              # Wait for CSV Succeeded
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for CSV phase=Succeeded..."
               for i in $(seq 1 120); do
                 PHASE=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
@@ -586,16 +703,13 @@ spec:
                 if [[ "${PHASE}" == "Succeeded" ]]; then
                   echo "[$(date -u +%FT%T.%3NZ)] CSV '${CSV}' ready"
 
-                  # Patch Subscription status so certsuite can discover the operator
                   oc patch subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
                     --type merge --subresource status \
-                    -p "{\"status\":{\"installedCSV\":\"${CSV}\"}}" 2>&1
+                    -p "{\"status\":{\"installedCSV\":\"${CSV}\"}}" 2>&1 || true
 
-                  # Label CSV for certsuite operator discovery
                   oc label csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
                     "redhat-best-practices-for-k8s.com/operator=target" --overwrite 2>&1
 
-                  # Label DaemonSet pods for certsuite pod discovery
                   DS_NAMES=$(oc get daemonsets -n "${INSTALL_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
                   for DS in ${DS_NAMES}; do
                     echo "[$(date -u +%FT%T.%3NZ)] Patching DaemonSet ${DS} with certsuite labels..."
@@ -608,6 +722,7 @@ spec:
                 elif [[ "${PHASE}" == "Failed" ]]; then
                   echo "ERROR: CSV failed" >&2
                   oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o jsonpath='{.status.message}' >&2
+                  oc get events -n "${INSTALL_NAMESPACE}" --sort-by='.lastTimestamp' | tail -30 >&2 || true
                   exit 1
                 fi
                 sleep 10
@@ -616,6 +731,7 @@ spec:
               echo "ERROR: Timed out waiting for CSV (phase=${PHASE})" >&2
               oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
               oc get pods -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
+              oc get events -n "${INSTALL_NAMESPACE}" --sort-by='.lastTimestamp' | tail -40 >&2 || true
               exit 1
 
           # ── Step 3: Deploy operands from test bundle ─────────────────
