@@ -264,21 +264,19 @@ spec:
             volumeMounts:
               - name: ics-data
                 mountPath: /ics
-            results:
-              - name: imageContentSourcesFile
-                type: string
-                description: Path to ICS YAML for create-cluster (empty when unused)
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
 
-              RESULT_PATH="$(results.imageContentSourcesFile.path)"
+              # Fixed path shared with create-cluster via the ics-data volume.
+              # Empty file = no mirrors (create-cluster treats empty content as no-op).
+              # Use $$(...) so Tekton does not treat bash substitutions as variables.
               ICS_OUT="/ics/image-content-sources.yaml"
+              : > "${ICS_OUT}"
 
               # Released / non-Konflux FBC: nothing to mirror
               if [[ "${FBC_FRAGMENT}" != quay.io/redhat-user-workloads/* ]]; then
-                echo "[$(date -u +%FT%T.%3NZ)] FBC is not on redhat-user-workloads; skipping imageContentSources"
-                echo -n "" > "${RESULT_PATH}"
+                echo "[$$(date -u +%FT%T.%3NZ)] FBC is not on redhat-user-workloads; skipping imageContentSources"
                 exit 0
               fi
 
@@ -286,43 +284,43 @@ spec:
               TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
               TENANT="${TENANT_AND_REPO%%/*}"
               FBC_REPO="${TENANT_AND_REPO#*/}"
-              echo "[$(date -u +%FT%T.%3NZ)] Tenant=${TENANT} FBC repo=${FBC_REPO}"
+              echo "[$$(date -u +%FT%T.%3NZ)] Tenant=${TENANT} FBC repo=${FBC_REPO}"
 
-              echo "[$(date -u +%FT%T.%3NZ)] Rendering FBC..."
+              echo "[$$(date -u +%FT%T.%3NZ)] Rendering FBC..."
               opm render "${FBC_FRAGMENT}" > /tmp/fbc.json
 
-              ORIG_BUNDLE_IMG=$(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)
+              ORIG_BUNDLE_IMG=$$(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)
               if [[ -z "${ORIG_BUNDLE_IMG}" || "${ORIG_BUNDLE_IMG}" == "null" ]]; then
                 echo "ERROR: No olm.bundle image in FBC" >&2
                 exit 1
               fi
-              echo "[$(date -u +%FT%T.%3NZ)] Catalog bundle image: ${ORIG_BUNDLE_IMG}"
+              echo "[$$(date -u +%FT%T.%3NZ)] Catalog bundle image: ${ORIG_BUNDLE_IMG}"
 
               # Resolve quay bundle (same digest, Konflux naming)
               BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
               [[ "${BUNDLE_DIGEST}" == "${BUNDLE_IMAGE}" ]] && BUNDLE_DIGEST="${ORIG_BUNDLE_IMG##*@}"
-              BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
+              BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
               QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
               if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
-                BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
+                BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
                 QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
                 skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
                   { echo "ERROR: Cannot resolve quay bundle for digest ${BUNDLE_DIGEST}" >&2; exit 1; }
               fi
-              echo "[$(date -u +%FT%T.%3NZ)] Quay bundle: ${QUAY_BUNDLE}"
+              echo "[$$(date -u +%FT%T.%3NZ)] Quay bundle: ${QUAY_BUNDLE}"
 
               # Candidate quay repos: COMPONENT_REPOS + derived bundle repo
               CANDIDATES=()
               if [[ -n "${COMPONENT_REPOS}" ]]; then
                 IFS=',' read -ra _repos <<< "${COMPONENT_REPOS}"
                 for r in "${_repos[@]}"; do
-                  r=$(echo "${r}" | xargs)
+                  r=$$(echo "${r}" | xargs)
                   [[ -n "${r}" ]] && CANDIDATES+=("${r}")
                 done
               fi
               CANDIDATES+=("${BUNDLE_REPO}")
 
-              echo "[$(date -u +%FT%T.%3NZ)] Rendering quay bundle for related images..."
+              echo "[$$(date -u +%FT%T.%3NZ)] Rendering quay bundle for related images..."
               opm render "${QUAY_BUNDLE}" > /tmp/bundle.json
 
               # All registry.redhat.io@sha256 refs from FBC + bundle
@@ -333,12 +331,11 @@ spec:
               } | grep -E '^registry\.redhat\.io/' | sort -u > /tmp/redhat-images.txt
 
               if [[ ! -s /tmp/redhat-images.txt ]]; then
-                echo "[$(date -u +%FT%T.%3NZ)] No registry.redhat.io digest refs; skipping imageContentSources"
-                echo -n "" > "${RESULT_PATH}"
+                echo "[$$(date -u +%FT%T.%3NZ)] No registry.redhat.io digest refs; skipping imageContentSources"
                 exit 0
               fi
 
-              echo "[$(date -u +%FT%T.%3NZ)] Matching digests to quay mirrors..."
+              echo "[$$(date -u +%FT%T.%3NZ)] Matching digests to quay mirrors..."
               : > "${ICS_OUT}"
               : > /tmp/seen-sources.txt
               UNMATCHED=()
@@ -374,7 +371,7 @@ spec:
                 fi
 
                 echo "${SOURCE}" >> /tmp/seen-sources.txt
-                echo "[$(date -u +%FT%T.%3NZ)]   ${SOURCE} -> ${MIRROR}"
+                echo "[$$(date -u +%FT%T.%3NZ)]   ${SOURCE} -> ${MIRROR}"
                 printf '%s\n' "- source: ${SOURCE}" "  mirrors:" "    - ${MIRROR}" >> "${ICS_OUT}"
               done < /tmp/redhat-images.txt
 
@@ -391,9 +388,8 @@ spec:
                 exit 1
               fi
 
-              echo "[$(date -u +%FT%T.%3NZ)] Built imageContentSources:"
+              echo "[$$(date -u +%FT%T.%3NZ)] Built imageContentSources:"
               cat "${ICS_OUT}"
-              echo -n "${ICS_OUT}" > "${RESULT_PATH}"
 
           - name: create-cluster
             ref:
@@ -415,8 +411,9 @@ spec:
                 value: "$(steps.get-latest-version-tag.results.version)"
               - name: instanceType
                 value: "$(tasks.pick-cluster-params.results.bundleArch)"
+              # Fixed path written by build-image-content-sources (empty file = no mirrors)
               - name: imageContentSourcesFile
-                value: "$(steps.build-image-content-sources.results.imageContentSourcesFile)"
+                value: "/ics/image-content-sources.yaml"
 
     # ── 6. Deploy Operator + Operands + Run Certsuite ──────────────────
     - name: deploy-and-test
