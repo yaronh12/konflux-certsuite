@@ -16,24 +16,25 @@ cluster is automatically destroyed when the PipelineRun completes.
 
 1. `parse-metadata` -- extract snapshot info
 2. `provision-eaas-space` -- allocate EaaS space
-3. `get-unreleased-bundle` -- get operator bundle from FBC
-4. `pick-cluster-params` -- select OCP version and architecture
-5. `provision-cluster` -- render FBC/bundle, match `registry.redhat.io`
-   digests to `COMPONENT_REPOS` on quay → pass as Hypershift
-   `imageContentSources` → create ephemeral cluster (HCCO applies a managed
-   IDMS so pulls redirect to quay.io)
-6. `deploy-and-test` -- standard CatalogSource from FBC image, OLM install,
+3. `get-unreleased-bundle` -- get catalog bundle ref + resolve quay.io bundle
+4. `pick-cluster-params` -- OCP version/arch from the pullable quay bundle
+5. `build-image-content-sources` -- load `.tekton/images-mirror-set.yaml`
+   (from `TEST_BUNDLE_REF` repo by default) → Hypershift `imageContentSources`
+6. `provision-cluster` -- create ephemeral cluster with those mirrors (HCCO
+   applies a managed IDMS; `registry.redhat.io` pulls redirect to quay.io)
+7. `deploy-and-test` -- standard CatalogSource from FBC image, OLM install,
    Hypershift CSV fixes (`minKubeVersion` / master `nodeSelector`), operands,
    certsuite
 
 ### Minimum Parameters
 
-- `TEST_BUNDLE_REF` — always required
-- `COMPONENT_REPOS` — required for **unreleased** operators (images only on
-  `quay.io/redhat-user-workloads`). Comma-separated quay repo names under the
-  FBC tenant, e.g.
-  `ptp-operator-mono-4-22,linuxptp-daemon-mono-4-22,cloud-event-proxy-mono-4-22,ptp-must-gather-mono-4-22`.
-  Omit for released operators on `registry.redhat.io`.
+- `TEST_BUNDLE_REF` — always required. For unreleased operators, point it at
+  the **operator monorepo** that also contains `.tekton/images-mirror-set.yaml`
+  (Konflux/Conforma convention). The pipeline discovers that file automatically.
+- `IMAGES_MIRROR_SET_REF` — optional override if the mirror set lives elsewhere.
+
+Released operators on `registry.redhat.io` need no mirror set (skipped when the
+FBC is not on `quay.io/redhat-user-workloads`).
 
 ## Shared Cluster Variant
 

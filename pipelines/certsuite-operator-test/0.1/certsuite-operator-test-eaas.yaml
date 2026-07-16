@@ -38,23 +38,23 @@ spec:
     - name: CHANNEL_NAME
       type: string
       default: ""
-    - name: COMPONENT_REPOS
+    - name: IMAGES_MIRROR_SET_REF
       type: string
       default: ""
       description: |
-        Comma-separated quay.io repository names (under the same
-        redhat-user-workloads tenant as the FBC) used to build Hypershift
-        imageContentSources for unreleased operators.
+        Optional override for the operator's ImageDigestMirrorSet used to build
+        Hypershift imageContentSources (managed IDMS on the guest cluster).
 
-        The pipeline renders the FBC/bundle, collects registry.redhat.io@digest
-        references, and matches each digest against these repos (plus the
-        auto-derived bundle repo and origin-kube-rbac-proxy). Digests match
-        across registries; only the path differs.
+        Format: URL[.git@revision][#path]
+        Example:
+          https://github.com/org/repo.git@release-4.22#.tekton/images-mirror-set.yaml
 
-        Example (PTP 4.22):
-          ptp-operator-mono-4-22,linuxptp-daemon-mono-4-22,cloud-event-proxy-mono-4-22,ptp-must-gather-mono-4-22
+        When empty (recommended), the pipeline uses the same git repo/revision as
+        TEST_BUNDLE_REF with path .tekton/images-mirror-set.yaml — the Konflux
+        / Conforma convention most operator monorepos already maintain.
 
-        Leave empty for released operators that pull from registry.redhat.io.
+        Leave unset for released operators that pull from registry.redhat.io
+        (or when the FBC is not on quay.io/redhat-user-workloads).
     - name: OCI_PUSH_SECRET
       type: string
       default: "imagerepository-ptp-operator-fbc-4-22-image-push"
@@ -107,6 +107,8 @@ spec:
         results:
           - name: unreleasedBundle
             value: "$(steps.get-bundle.results.unreleasedBundle)"
+          - name: quayBundle
+            value: "$(steps.resolve-quay-bundle.results.quayBundle)"
           - name: packageName
             value: "$(steps.get-bundle.results.packageName)"
           - name: channelName
@@ -135,6 +137,62 @@ spec:
                 value: $(params.PACKAGE_NAME)
               - name: channelName
                 value: $(params.CHANNEL_NAME)
+
+          # Catalog refs point at registry.redhat.io (401 for unreleased images).
+          # Resolve the same digest on quay.io before any step tries opm render.
+          - name: resolve-quay-bundle
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            env:
+              - name: FBC_FRAGMENT
+                value: "$(tasks.parse-metadata.results.component-container-image)"
+              - name: BUNDLE_IMAGE
+                value: "$(steps.get-bundle.results.unreleasedBundle)"
+            results:
+              - name: quayBundle
+                type: string
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              RESULT="$(results.quayBundle.path)"
+
+              if [[ -z "${BUNDLE_IMAGE}" ]]; then
+                echo -n "" > "${RESULT}"
+                exit 0
+              fi
+
+              # Already a quay ref (or non-Konflux) — pass through
+              if [[ "${BUNDLE_IMAGE}" == quay.io/* ]]; then
+                echo "[$$(date -u +%FT%T.%3NZ)] Bundle already on quay: ${BUNDLE_IMAGE}"
+                echo -n "${BUNDLE_IMAGE}" > "${RESULT}"
+                exit 0
+              fi
+
+              if [[ "${FBC_FRAGMENT}" != quay.io/redhat-user-workloads/* ]]; then
+                echo "[$$(date -u +%FT%T.%3NZ)] FBC not on redhat-user-workloads; keeping catalog ref"
+                echo -n "${BUNDLE_IMAGE}" > "${RESULT}"
+                exit 0
+              fi
+
+              FBC_BASE="${FBC_FRAGMENT%%@*}"
+              TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
+              TENANT="${TENANT_AND_REPO%%/*}"
+              FBC_REPO="${TENANT_AND_REPO#*/}"
+              BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
+
+              BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
+              QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
+              echo "[$$(date -u +%FT%T.%3NZ)] Trying ${QUAY_BUNDLE}"
+              if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
+                BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
+                QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
+                echo "[$$(date -u +%FT%T.%3NZ)] Trying fallback ${QUAY_BUNDLE}"
+                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
+                  { echo "ERROR: Cannot resolve quay bundle for digest ${BUNDLE_DIGEST}" >&2; exit 1; }
+              fi
+
+              echo "[$$(date -u +%FT%T.%3NZ)] Resolved quay bundle: ${QUAY_BUNDLE}"
+              echo -n "${QUAY_BUNDLE}" > "${RESULT}"
 
     # ── 4. Pick Cluster Params ─────────────────────────────────────────
     - name: pick-cluster-params
@@ -190,14 +248,14 @@ spec:
                 - name: pathInRepo
                   value: stepactions/bundles/pick-cluster-arch/0.1/pick-cluster-arch.yaml
             params:
-              # Must be the operator bundle, not the FBC fragment — arch labels
-              # live on the CSV inside the bundle. Passing FBC causes jq null errors.
+              # Must be a pullable operator bundle (quay.io for unreleased).
+              # Catalog refs on registry.redhat.io return 401 for pre-release digests.
               - name: bundleImage
-                value: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
+                value: "$(tasks.get-unreleased-bundle.results.quayBundle)"
 
     # ── 5. Build Hypershift imageContentSources ────────────────────────
-    # Separate task so the YAML can be passed as a string param into the
-    # create-cluster StepAction (StepActions cannot take volumeMounts).
+    # Fetch the operator's ImageDigestMirrorSet (Conforma convention), convert
+    # to Hypershift imageContentSources, pass as a string into create-cluster.
     - name: build-image-content-sources
       runAfter:
         - pick-cluster-params
@@ -208,37 +266,31 @@ spec:
       params:
         - name: fbcFragment
           value: "$(tasks.parse-metadata.results.component-container-image)"
-        - name: bundleImage
-          value: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
-        - name: componentRepos
-          value: $(params.COMPONENT_REPOS)
+        - name: testBundleRef
+          value: $(params.TEST_BUNDLE_REF)
+        - name: imagesMirrorSetRef
+          value: $(params.IMAGES_MIRROR_SET_REF)
       taskSpec:
         params:
           - name: fbcFragment
             type: string
-          - name: bundleImage
+          - name: testBundleRef
             type: string
-          - name: componentRepos
+          - name: imagesMirrorSetRef
             type: string
         results:
           - name: imageContentSources
             description: Hypershift imageContentSources YAML (empty if none)
         steps:
           - name: build
-            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
-            computeResources:
-              limits:
-                memory: 8Gi
-              requests:
-                memory: 4Gi
-                cpu: "1"
+            image: quay.io/konflux-ci/task-runner:1.5.0@sha256:200019314a50be5b6dd06f362c794c92a700583a522c5eee9a41e3eab7f706c5
             env:
               - name: FBC_FRAGMENT
                 value: "$(params.fbcFragment)"
-              - name: BUNDLE_IMAGE
-                value: "$(params.bundleImage)"
-              - name: COMPONENT_REPOS
-                value: "$(params.componentRepos)"
+              - name: TEST_BUNDLE_REF
+                value: "$(params.testBundleRef)"
+              - name: IMAGES_MIRROR_SET_REF
+                value: "$(params.imagesMirrorSetRef)"
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
@@ -259,111 +311,78 @@ spec:
                 exit 0
               fi
 
-              FBC_BASE="${FBC_FRAGMENT%%@*}"
-              TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
-              TENANT="${TENANT_AND_REPO%%/*}"
-              FBC_REPO="${TENANT_AND_REPO#*/}"
-              echo "[$$(date -u +%FT%T.%3NZ)] Tenant=${TENANT} FBC repo=${FBC_REPO}"
-
-              echo "[$$(date -u +%FT%T.%3NZ)] Rendering FBC..."
-              opm render "${FBC_FRAGMENT}" > /tmp/fbc.json
-
-              ORIG_BUNDLE_IMG=$$(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)
-              if [[ -z "${ORIG_BUNDLE_IMG}" || "${ORIG_BUNDLE_IMG}" == "null" ]]; then
-                echo "ERROR: No olm.bundle image in FBC" >&2
-                exit 1
-              fi
-              echo "[$$(date -u +%FT%T.%3NZ)] Catalog bundle image: ${ORIG_BUNDLE_IMG}"
-
-              # Resolve quay bundle (same digest, Konflux naming)
-              BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
-              [[ "${BUNDLE_DIGEST}" == "${BUNDLE_IMAGE}" ]] && BUNDLE_DIGEST="${ORIG_BUNDLE_IMG##*@}"
-              BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
-              QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
-              if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
-                BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
-                QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
-                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
-                  { echo "ERROR: Cannot resolve quay bundle for digest ${BUNDLE_DIGEST}" >&2; exit 1; }
-              fi
-              echo "[$$(date -u +%FT%T.%3NZ)] Quay bundle: ${QUAY_BUNDLE}"
-
-              # Candidate quay repos: COMPONENT_REPOS + derived bundle repo
-              CANDIDATES=()
-              if [[ -n "${COMPONENT_REPOS}" ]]; then
-                IFS=',' read -ra _repos <<< "${COMPONENT_REPOS}"
-                for r in "${_repos[@]}"; do
-                  r=$$(echo "${r}" | xargs)
-                  [[ -n "${r}" ]] && CANDIDATES+=("${r}")
-                done
-              fi
-              CANDIDATES+=("${BUNDLE_REPO}")
-
-              echo "[$$(date -u +%FT%T.%3NZ)] Rendering quay bundle for related images..."
-              opm render "${QUAY_BUNDLE}" > /tmp/bundle.json
-
-              # All registry.redhat.io@sha256 refs from FBC + bundle
-              {
-                jq -r '.. | strings | select(test("registry\\.redhat\\.io/.+@sha256:[a-f0-9]+"))' /tmp/fbc.json
-                jq -r '.. | strings | select(test("registry\\.redhat\\.io/.+@sha256:[a-f0-9]+"))' /tmp/bundle.json
-                echo "${ORIG_BUNDLE_IMG}"
-              } | grep -E '^registry\.redhat\.io/' | sort -u > /tmp/redhat-images.txt
-
-              if [[ ! -s /tmp/redhat-images.txt ]]; then
-                echo "[$$(date -u +%FT%T.%3NZ)] No registry.redhat.io digest refs; skipping imageContentSources"
-                exit 0
-              fi
-
-              echo "[$$(date -u +%FT%T.%3NZ)] Matching digests to quay mirrors..."
-              : > "${ICS_OUT}"
-              : > /tmp/seen-sources.txt
-              UNMATCHED=()
-
-              while IFS= read -r IMG; do
-                [[ -z "${IMG}" ]] && continue
-                DIGEST="${IMG##*@}"
-                SOURCE="${IMG%@*}"
-                SOURCE="${SOURCE%%:*}"  # drop any tag if present before @
-
-                # One ICS entry per source repository
-                grep -qxF "${SOURCE}" /tmp/seen-sources.txt && continue
-
-                MIRROR=""
-                if [[ "${SOURCE}" == *kube-rbac-proxy* ]]; then
-                  if skopeo inspect --raw "docker://quay.io/openshift/origin-kube-rbac-proxy@${DIGEST}" &>/dev/null; then
-                    MIRROR="quay.io/openshift/origin-kube-rbac-proxy"
-                  fi
+              # Resolve mirror-set ref: explicit override, else same repo as TEST_BUNDLE_REF
+              MIRROR_REF="${IMAGES_MIRROR_SET_REF}"
+              if [[ -z "${MIRROR_REF}" ]]; then
+                FULL_URL="${TEST_BUNDLE_REF%%#*}"
+                if [[ "${FULL_URL}" == *".git@"* ]]; then
+                  GIT_URL="${FULL_URL%@*}"
+                  GIT_REF="${FULL_URL##*.git@}"
+                elif [[ "${FULL_URL}" =~ ^(https://[^@]+)@([^@]+)$ ]]; then
+                  GIT_URL="${BASH_REMATCH[1]}"
+                  GIT_REF="${BASH_REMATCH[2]}"
+                else
+                  GIT_URL="${FULL_URL}"
+                  GIT_REF="main"
                 fi
-                if [[ -z "${MIRROR}" ]]; then
-                  for REPO in "${CANDIDATES[@]}"; do
-                    CAND="quay.io/redhat-user-workloads/${TENANT}/${REPO}"
-                    if skopeo inspect --raw "docker://${CAND}@${DIGEST}" &>/dev/null; then
-                      MIRROR="${CAND}"
-                      break
-                    fi
-                  done
+                MIRROR_REF="${GIT_URL%.git}.git@${GIT_REF}#.tekton/images-mirror-set.yaml"
+                echo "[$$(date -u +%FT%T.%3NZ)] Defaulting IMAGES_MIRROR_SET_REF from TEST_BUNDLE_REF"
+              fi
+
+              FULL_URL="${MIRROR_REF%%#*}"
+              FILE_PATH="${MIRROR_REF#*#}"
+              [[ "${FILE_PATH}" == "${MIRROR_REF}" ]] && FILE_PATH=".tekton/images-mirror-set.yaml"
+
+              if [[ "${FULL_URL}" == *".git@"* ]]; then
+                GIT_URL="${FULL_URL%@*}"
+                GIT_REF="${FULL_URL##*.git@}"
+              elif [[ "${FULL_URL}" =~ ^(https://[^@]+)@([^@]+)$ ]]; then
+                GIT_URL="${BASH_REMATCH[1]}"
+                GIT_REF="${BASH_REMATCH[2]}"
+              else
+                GIT_URL="${FULL_URL}"
+                GIT_REF="main"
+              fi
+              GIT_URL="${GIT_URL%.git}"
+
+              echo "[$$(date -u +%FT%T.%3NZ)] Fetching mirror set: ${GIT_URL}@${GIT_REF} path=${FILE_PATH}"
+
+              IDMS_FILE="/tmp/images-mirror-set.yaml"
+              if [[ "${GIT_URL}" =~ github.com/([^/]+)/([^/]+) ]]; then
+                ORG="${BASH_REMATCH[1]}"
+                REPO="${BASH_REMATCH[2]}"
+                RAW_URL="https://raw.githubusercontent.com/${ORG}/${REPO}/${GIT_REF}/${FILE_PATH}"
+                if ! curl -fsSL "${RAW_URL}" -o "${IDMS_FILE}"; then
+                  echo "ERROR: Failed to fetch ${RAW_URL}" >&2
+                  echo "Unreleased operators need .tekton/images-mirror-set.yaml in the monorepo" >&2
+                  echo "(same file used by Conforma). Or set IMAGES_MIRROR_SET_REF explicitly." >&2
+                  exit 1
                 fi
-
-                if [[ -z "${MIRROR}" ]]; then
-                  UNMATCHED+=("${IMG}")
-                  continue
+              else
+                CLONE_DIR=$$(mktemp -d)
+                curl -fsSL "${GIT_URL}/archive/${GIT_REF}.tar.gz" | tar xz -C "${CLONE_DIR}" --strip-components=1
+                if [[ ! -f "${CLONE_DIR}/${FILE_PATH}" ]]; then
+                  echo "ERROR: ${FILE_PATH} not found in ${GIT_URL}@${GIT_REF}" >&2
+                  exit 1
                 fi
+                cp "${CLONE_DIR}/${FILE_PATH}" "${IDMS_FILE}"
+                rm -rf "${CLONE_DIR}"
+              fi
 
-                echo "${SOURCE}" >> /tmp/seen-sources.txt
-                echo "[$$(date -u +%FT%T.%3NZ)]   ${SOURCE} -> ${MIRROR}"
-                printf '%s\n' "- source: ${SOURCE}" "  mirrors:" "    - ${MIRROR}" >> "${ICS_OUT}"
-              done < /tmp/redhat-images.txt
-
-              if [[ ${#UNMATCHED[@]} -gt 0 ]]; then
-                echo "ERROR: Could not find quay mirrors for:" >&2
-                printf '  %s\n' "${UNMATCHED[@]}" >&2
-                echo "Pass COMPONENT_REPOS with the tenant quay repo names that hold these digests." >&2
-                echo "Candidates tried: ${CANDIDATES[*]}" >&2
+              KIND=$$(yq -r 'select(.kind != null) | .kind' "${IDMS_FILE}" | head -1)
+              if [[ "${KIND}" == "ImageDigestMirrorSet" ]]; then
+                yq -o=yaml 'select(.kind == "ImageDigestMirrorSet") | .spec.imageDigestMirrors' \
+                  "${IDMS_FILE}" > "${ICS_OUT}"
+              elif yq -e '.[0].source' "${IDMS_FILE}" &>/dev/null; then
+                cp "${IDMS_FILE}" "${ICS_OUT}"
+              else
+                echo "ERROR: ${FILE_PATH} is neither ImageDigestMirrorSet nor an imageContentSources list" >&2
+                cat "${IDMS_FILE}" >&2
                 exit 1
               fi
 
-              if [[ ! -s "${ICS_OUT}" ]]; then
-                echo "ERROR: Built empty imageContentSources" >&2
+              if [[ ! -s "${ICS_OUT}" ]] || [[ "$$(yq 'length' "${ICS_OUT}")" == "0" ]]; then
+                echo "ERROR: No mirrors found in ${FILE_PATH}" >&2
                 exit 1
               fi
 
@@ -558,7 +577,7 @@ spec:
                 fi
                 if [[ ${i} -eq 30 ]]; then
                   echo "[$(date -u +%FT%T.%3NZ)] WARNING: No IDMS found. Unreleased registry.redhat.io pulls may fail."
-                  echo "  Ensure COMPONENT_REPOS was set and ClusterTemplate supports imageContentSources."
+                  echo "  Ensure .tekton/images-mirror-set.yaml exists (or IMAGES_MIRROR_SET_REF) and ClusterTemplate supports imageContentSources."
                 fi
                 sleep 5
               done
