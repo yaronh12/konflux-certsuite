@@ -38,11 +38,14 @@ spec:
     - name: CHANNEL_NAME
       type: string
       default: ""
-    # NOTE: CREDENTIALS_SECRET_NAME, OCI_REF, CERT_TRACK_* params are not
-    # included here because Konflux IntegrationTestScenarios do not provide
-    # pipeline-level workspace bindings needed by the collect-results task.
-    # Results collection should be added as a step inside deploy-and-test
-    # when needed.
+    - name: OCI_PUSH_SECRET
+      type: string
+      default: "imagerepository-ptp-operator-fbc-4-22-image-push"
+      description: |
+        kubernetes.io/dockerconfigjson Secret with push access to the Quay repo
+        where certsuite results are stored. Use the component's ImageRepository
+        push secret (oc get imagerepository -o jsonpath='{.status.credentials.push-secret}').
+        Results are tagged on the same image URL as the FBC/component under test.
 
   tasks:
     # ── 1. Parse Snapshot Metadata ──────────────────────────────────────
@@ -248,6 +251,8 @@ spec:
           value: $(params.TEST_BUNDLE_REF)
         - name: certsuiteLabels
           value: $(params.CERTSUITE_LABELS)
+        - name: ociPushSecret
+          value: $(params.OCI_PUSH_SECRET)
       taskSpec:
         params:
           - name: eaasSpaceSecretRef
@@ -266,9 +271,15 @@ spec:
             type: string
           - name: certsuiteLabels
             type: string
+          - name: ociPushSecret
+            type: string
         volumes:
           - name: credentials
             emptyDir: {}
+          - name: oci-push-creds
+            secret:
+              secretName: $(params.ociPushSecret)
+              optional: true
         steps:
           # ── Step 1: Get kubeconfig from EaaS ─────────────────────────
           - name: get-kubeconfig
@@ -754,17 +765,16 @@ spec:
                 echo "[$(date -u +%FT%T.%3NZ)] ${SUITE}: total=${TOTAL} passed=${PASSED} failed=${FAILED}"
               done
 
-          # ── Step 5: Push results to OCI registry ────────────────────
+          # ── Step 5: Push results to the component's Quay repo ───────
           - name: push-results
             image: ghcr.io/oras-project/oras:v1.2.2
             onError: continue
             volumeMounts:
-              - name: credentials
-                mountPath: /credentials
+              - name: oci-push-creds
+                mountPath: /oci-push-creds
+                readOnly: true
             env:
-              - name: KUBECONFIG
-                value: "/credentials/$(steps.get-kubeconfig.results.kubeconfig)"
-              - name: SNAPSHOT
+              - name: FBC_FRAGMENT
                 value: "$(params.fbcFragment)"
             script: |
               #!/bin/sh
@@ -776,29 +786,28 @@ spec:
                 exit 0
               fi
 
-              IMAGE_REF=$(echo "${SNAPSHOT}" | cut -d'@' -f1)
+              IMAGE_REF=$(echo "${FBC_FRAGMENT}" | cut -d'@' -f1)
               if [ -z "${IMAGE_REF}" ]; then
-                echo "Cannot derive OCI ref from SNAPSHOT. Skipping."
+                echo "Cannot derive OCI ref from FBC_FRAGMENT. Skipping."
                 exit 0
               fi
+
+              # Use the component ImageRepository push secret (mounted volume)
+              DOCKER_CFG="/oci-push-creds/.dockerconfigjson"
+              if [ ! -f "${DOCKER_CFG}" ]; then
+                echo "WARNING: OCI push secret not mounted at ${DOCKER_CFG}."
+                echo "Set OCI_PUSH_SECRET to the component ImageRepository push secret."
+                exit 0
+              fi
+              mkdir -p /tmp/docker
+              cp "${DOCKER_CFG}" /tmp/docker/config.json
+              export DOCKER_CONFIG=/tmp/docker
 
               OCI_TAG="certsuite-results-$(date -u +%Y%m%d-%H%M%S)"
               OCI_REF="${IMAGE_REF}:${OCI_TAG}"
 
               echo "Packaging results..."
               tar czf /tmp/certsuite-results.tar.gz -C /workspace results/
-
-              for CFG in \
-                /tekton/creds/.docker/config.json \
-                "${HOME}/.docker/config.json" \
-                /run/secrets/kubernetes.io/dockerconfig/config.json; do
-                if [ -f "${CFG}" ]; then
-                  echo "Using docker config: ${CFG}"
-                  DOCKER_CONFIG=$(dirname "${CFG}")
-                  export DOCKER_CONFIG
-                  break
-                fi
-              done
 
               echo "Pushing results to: ${OCI_REF}"
               cd /tmp
@@ -814,6 +823,7 @@ spec:
                 echo "WARNING: OCI push failed (non-fatal)"
               fi
 
-    # Results are printed in the run-certsuite step and pushed to OCI
-    # in the push-results step. Download with:
+    # Results are pushed to the same Quay repo as the FBC/component image,
+    # tagged certsuite-results-<timestamp>. Auth via OCI_PUSH_SECRET
+    # (ImageRepository push secret). Download with:
     #   oras pull <OCI_REF printed in push-results logs>
