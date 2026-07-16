@@ -107,8 +107,9 @@ spec:
         results:
           - name: unreleasedBundle
             value: "$(steps.get-bundle.results.unreleasedBundle)"
+          # Written directly by resolve-quay-bundle (task-level result, not step result)
           - name: quayBundle
-            value: "$(steps.resolve-quay-bundle.results.quayBundle)"
+            description: Pullable quay.io bundle image (same digest as catalog ref)
           - name: packageName
             value: "$(steps.get-bundle.results.packageName)"
           - name: channelName
@@ -147,14 +148,11 @@ spec:
                 value: "$(tasks.parse-metadata.results.component-container-image)"
               - name: BUNDLE_IMAGE
                 value: "$(steps.get-bundle.results.unreleasedBundle)"
-            results:
-              - name: quayBundle
-                type: string
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
 
-              # Avoid bash $(...) / Tekton $$ escapes — use parameter expansion only.
+              # Task-level result path (Tekton substitutes before bash runs).
               RESULT_PATH=$(results.quayBundle.path)
 
               if [[ -z "${BUNDLE_IMAGE}" ]]; then
