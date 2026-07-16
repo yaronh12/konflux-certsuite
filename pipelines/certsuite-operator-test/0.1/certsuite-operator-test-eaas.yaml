@@ -154,23 +154,24 @@ spec:
               #!/usr/bin/env bash
               set -euo pipefail
 
-              RESULT="$(results.quayBundle.path)"
+              # Avoid bash $(...) / Tekton $$ escapes — use parameter expansion only.
+              RESULT_PATH=$(results.quayBundle.path)
 
               if [[ -z "${BUNDLE_IMAGE}" ]]; then
-                echo -n "" > "${RESULT}"
+                echo -n "" > "${RESULT_PATH}"
                 exit 0
               fi
 
-              # Already a quay ref (or non-Konflux) — pass through
+              # Already a quay ref — pass through
               if [[ "${BUNDLE_IMAGE}" == quay.io/* ]]; then
-                echo "[$$(date -u +%FT%T.%3NZ)] Bundle already on quay: ${BUNDLE_IMAGE}"
-                echo -n "${BUNDLE_IMAGE}" > "${RESULT}"
+                echo "Bundle already on quay: ${BUNDLE_IMAGE}"
+                echo -n "${BUNDLE_IMAGE}" > "${RESULT_PATH}"
                 exit 0
               fi
 
               if [[ "${FBC_FRAGMENT}" != quay.io/redhat-user-workloads/* ]]; then
-                echo "[$$(date -u +%FT%T.%3NZ)] FBC not on redhat-user-workloads; keeping catalog ref"
-                echo -n "${BUNDLE_IMAGE}" > "${RESULT}"
+                echo "FBC not on redhat-user-workloads; keeping catalog ref"
+                echo -n "${BUNDLE_IMAGE}" > "${RESULT_PATH}"
                 exit 0
               fi
 
@@ -180,19 +181,21 @@ spec:
               FBC_REPO="${TENANT_AND_REPO#*/}"
               BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
 
-              BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
+              BUNDLE_REPO="${FBC_REPO/-fbc-/-bundle-mono-}"
               QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
-              echo "[$$(date -u +%FT%T.%3NZ)] Trying ${QUAY_BUNDLE}"
+              echo "Trying ${QUAY_BUNDLE}"
               if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
-                BUNDLE_REPO=$$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
+                BUNDLE_REPO="${FBC_REPO/-fbc-/-bundle-}"
                 QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
-                echo "[$$(date -u +%FT%T.%3NZ)] Trying fallback ${QUAY_BUNDLE}"
-                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
-                  { echo "ERROR: Cannot resolve quay bundle for digest ${BUNDLE_DIGEST}" >&2; exit 1; }
+                echo "Trying fallback ${QUAY_BUNDLE}"
+                if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
+                  echo "ERROR: Cannot resolve quay bundle for digest ${BUNDLE_DIGEST}" >&2
+                  exit 1
+                fi
               fi
 
-              echo "[$$(date -u +%FT%T.%3NZ)] Resolved quay bundle: ${QUAY_BUNDLE}"
-              echo -n "${QUAY_BUNDLE}" > "${RESULT}"
+              echo "Resolved quay bundle: ${QUAY_BUNDLE}"
+              echo -n "${QUAY_BUNDLE}" > "${RESULT_PATH}"
 
     # ── 4. Pick Cluster Params ─────────────────────────────────────────
     - name: pick-cluster-params
@@ -295,19 +298,19 @@ spec:
               #!/usr/bin/env bash
               set -euo pipefail
 
-              # Use $$(...) so Tekton does not treat bash substitutions as variables.
+              # Use backticks for command substitution so Tekton does not mangle $$(...).
               ICS_OUT="/tmp/image-content-sources.yaml"
               : > "${ICS_OUT}"
-              RESULT="$(results.imageContentSources.path)"
+              RESULT_PATH=$(results.imageContentSources.path)
 
               finish() {
-                cat "${ICS_OUT}" > "${RESULT}"
+                cat "${ICS_OUT}" > "${RESULT_PATH}"
               }
               trap finish EXIT
 
               # Released / non-Konflux FBC: nothing to mirror
               if [[ "${FBC_FRAGMENT}" != quay.io/redhat-user-workloads/* ]]; then
-                echo "[$$(date -u +%FT%T.%3NZ)] FBC is not on redhat-user-workloads; skipping imageContentSources"
+                echo "FBC is not on redhat-user-workloads; skipping imageContentSources"
                 exit 0
               fi
 
@@ -318,15 +321,21 @@ spec:
                 if [[ "${FULL_URL}" == *".git@"* ]]; then
                   GIT_URL="${FULL_URL%@*}"
                   GIT_REF="${FULL_URL##*.git@}"
-                elif [[ "${FULL_URL}" =~ ^(https://[^@]+)@([^@]+)$ ]]; then
-                  GIT_URL="${BASH_REMATCH[1]}"
-                  GIT_REF="${BASH_REMATCH[2]}"
                 else
-                  GIT_URL="${FULL_URL}"
-                  GIT_REF="main"
+                  # https://host/org/repo@branch (no .git before @)
+                  case "${FULL_URL}" in
+                    https://*@*)
+                      GIT_REF="${FULL_URL##*@}"
+                      GIT_URL="${FULL_URL%@*}"
+                      ;;
+                    *)
+                      GIT_URL="${FULL_URL}"
+                      GIT_REF="main"
+                      ;;
+                  esac
                 fi
                 MIRROR_REF="${GIT_URL%.git}.git@${GIT_REF}#.tekton/images-mirror-set.yaml"
-                echo "[$$(date -u +%FT%T.%3NZ)] Defaulting IMAGES_MIRROR_SET_REF from TEST_BUNDLE_REF"
+                echo "Defaulting IMAGES_MIRROR_SET_REF from TEST_BUNDLE_REF: ${MIRROR_REF}"
               fi
 
               FULL_URL="${MIRROR_REF%%#*}"
@@ -336,40 +345,50 @@ spec:
               if [[ "${FULL_URL}" == *".git@"* ]]; then
                 GIT_URL="${FULL_URL%@*}"
                 GIT_REF="${FULL_URL##*.git@}"
-              elif [[ "${FULL_URL}" =~ ^(https://[^@]+)@([^@]+)$ ]]; then
-                GIT_URL="${BASH_REMATCH[1]}"
-                GIT_REF="${BASH_REMATCH[2]}"
               else
-                GIT_URL="${FULL_URL}"
-                GIT_REF="main"
+                case "${FULL_URL}" in
+                  https://*@*)
+                    GIT_REF="${FULL_URL##*@}"
+                    GIT_URL="${FULL_URL%@*}"
+                    ;;
+                  *)
+                    GIT_URL="${FULL_URL}"
+                    GIT_REF="main"
+                    ;;
+                esac
               fi
               GIT_URL="${GIT_URL%.git}"
 
-              echo "[$$(date -u +%FT%T.%3NZ)] Fetching mirror set: ${GIT_URL}@${GIT_REF} path=${FILE_PATH}"
+              echo "Fetching mirror set: ${GIT_URL}@${GIT_REF} path=${FILE_PATH}"
 
               IDMS_FILE="/tmp/images-mirror-set.yaml"
-              if [[ "${GIT_URL}" =~ github.com/([^/]+)/([^/]+) ]]; then
-                ORG="${BASH_REMATCH[1]}"
-                REPO="${BASH_REMATCH[2]}"
-                RAW_URL="https://raw.githubusercontent.com/${ORG}/${REPO}/${GIT_REF}/${FILE_PATH}"
-                if ! curl -fsSL "${RAW_URL}" -o "${IDMS_FILE}"; then
-                  echo "ERROR: Failed to fetch ${RAW_URL}" >&2
-                  echo "Unreleased operators need .tekton/images-mirror-set.yaml in the monorepo" >&2
-                  echo "(same file used by Conforma). Or set IMAGES_MIRROR_SET_REF explicitly." >&2
-                  exit 1
-                fi
-              else
-                CLONE_DIR=$$(mktemp -d)
-                curl -fsSL "${GIT_URL}/archive/${GIT_REF}.tar.gz" | tar xz -C "${CLONE_DIR}" --strip-components=1
-                if [[ ! -f "${CLONE_DIR}/${FILE_PATH}" ]]; then
-                  echo "ERROR: ${FILE_PATH} not found in ${GIT_URL}@${GIT_REF}" >&2
-                  exit 1
-                fi
-                cp "${CLONE_DIR}/${FILE_PATH}" "${IDMS_FILE}"
-                rm -rf "${CLONE_DIR}"
-              fi
+              case "${GIT_URL}" in
+                *github.com/*/*)
+                  ORG_REPO="${GIT_URL#*github.com/}"
+                  ORG="${ORG_REPO%%/*}"
+                  REPO="${ORG_REPO#*/}"
+                  REPO="${REPO%%/*}"
+                  RAW_URL="https://raw.githubusercontent.com/${ORG}/${REPO}/${GIT_REF}/${FILE_PATH}"
+                  if ! curl -fsSL "${RAW_URL}" -o "${IDMS_FILE}"; then
+                    echo "ERROR: Failed to fetch ${RAW_URL}" >&2
+                    echo "Unreleased operators need .tekton/images-mirror-set.yaml in the monorepo" >&2
+                    echo "(same file used by Conforma). Or set IMAGES_MIRROR_SET_REF explicitly." >&2
+                    exit 1
+                  fi
+                  ;;
+                *)
+                  CLONE_DIR=`mktemp -d`
+                  curl -fsSL "${GIT_URL}/archive/${GIT_REF}.tar.gz" | tar xz -C "${CLONE_DIR}" --strip-components=1
+                  if [[ ! -f "${CLONE_DIR}/${FILE_PATH}" ]]; then
+                    echo "ERROR: ${FILE_PATH} not found in ${GIT_URL}@${GIT_REF}" >&2
+                    exit 1
+                  fi
+                  cp "${CLONE_DIR}/${FILE_PATH}" "${IDMS_FILE}"
+                  rm -rf "${CLONE_DIR}"
+                  ;;
+              esac
 
-              KIND=$$(yq -r 'select(.kind != null) | .kind' "${IDMS_FILE}" | head -1)
+              KIND=`yq -r 'select(.kind != null) | .kind' "${IDMS_FILE}" | head -1`
               if [[ "${KIND}" == "ImageDigestMirrorSet" ]]; then
                 yq -o=yaml 'select(.kind == "ImageDigestMirrorSet") | .spec.imageDigestMirrors' \
                   "${IDMS_FILE}" > "${ICS_OUT}"
@@ -381,12 +400,13 @@ spec:
                 exit 1
               fi
 
-              if [[ ! -s "${ICS_OUT}" ]] || [[ "$$(yq 'length' "${ICS_OUT}")" == "0" ]]; then
+              ICS_LEN=`yq 'length' "${ICS_OUT}"`
+              if [[ ! -s "${ICS_OUT}" ]] || [[ "${ICS_LEN}" == "0" ]]; then
                 echo "ERROR: No mirrors found in ${FILE_PATH}" >&2
                 exit 1
               fi
 
-              echo "[$$(date -u +%FT%T.%3NZ)] Built imageContentSources:"
+              echo "Built imageContentSources:"
               cat "${ICS_OUT}"
 
     # ── 6. Provision Ephemeral Cluster ─────────────────────────────────
