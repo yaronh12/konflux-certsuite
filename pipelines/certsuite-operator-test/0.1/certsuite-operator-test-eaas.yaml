@@ -195,12 +195,10 @@ spec:
               - name: bundleImage
                 value: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
 
-    # ── 5. Provision Ephemeral Cluster ─────────────────────────────────
-    # Note: do not gate on ocpVersion/bundleArch results. Those StepAction
-    # results sometimes do not surface on the TaskRun, which makes Tekton
-    # treat them as "" and silently skip this task (PipelineRun still Succeeded).
-    # pick-cluster-params already succeeded if we got here; fail loudly instead.
-    - name: provision-cluster
+    # ── 5. Build Hypershift imageContentSources ────────────────────────
+    # Separate task so the YAML can be passed as a string param into the
+    # create-cluster StepAction (StepActions cannot take volumeMounts).
+    - name: build-image-content-sources
       runAfter:
         - pick-cluster-params
       when:
@@ -223,30 +221,10 @@ spec:
           - name: componentRepos
             type: string
         results:
-          - name: clusterName
-            value: "$(steps.create-cluster.results.clusterName)"
-        volumes:
-          - name: ics-data
-            emptyDir: {}
+          - name: imageContentSources
+            description: Hypershift imageContentSources YAML (empty if none)
         steps:
-          - name: get-latest-version-tag
-            ref:
-              resolver: git
-              params:
-                - name: url
-                  value: https://github.com/konflux-ci/build-definitions.git
-                - name: revision
-                  value: main
-                - name: pathInRepo
-                  value: stepactions/eaas-get-latest-openshift-version-by-prefix/0.1/eaas-get-latest-openshift-version-by-prefix.yaml
-            params:
-              - name: prefix
-                value: "$(tasks.pick-cluster-params.results.ocpVersion)"
-
-          # Build Hypershift imageContentSources from FBC + bundle:
-          # collect registry.redhat.io@digest refs, match digests to quay repos.
-          # HCCO turns this into a managed IDMS (bypasses guest ValidatingAdmissionPolicy).
-          - name: build-image-content-sources
+          - name: build
             image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
             computeResources:
               limits:
@@ -261,18 +239,19 @@ spec:
                 value: "$(params.bundleImage)"
               - name: COMPONENT_REPOS
                 value: "$(params.componentRepos)"
-            volumeMounts:
-              - name: ics-data
-                mountPath: /ics
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
 
-              # Fixed path shared with create-cluster via the ics-data volume.
-              # Empty file = no mirrors (create-cluster treats empty content as no-op).
               # Use $$(...) so Tekton does not treat bash substitutions as variables.
-              ICS_OUT="/ics/image-content-sources.yaml"
+              ICS_OUT="/tmp/image-content-sources.yaml"
               : > "${ICS_OUT}"
+              RESULT="$(results.imageContentSources.path)"
+
+              finish() {
+                cat "${ICS_OUT}" > "${RESULT}"
+              }
+              trap finish EXIT
 
               # Released / non-Konflux FBC: nothing to mirror
               if [[ "${FBC_FRAGMENT}" != quay.io/redhat-user-workloads/* ]]; then
@@ -391,6 +370,42 @@ spec:
               echo "[$$(date -u +%FT%T.%3NZ)] Built imageContentSources:"
               cat "${ICS_OUT}"
 
+    # ── 6. Provision Ephemeral Cluster ─────────────────────────────────
+    # Note: do not gate on ocpVersion/bundleArch results. Those StepAction
+    # results sometimes do not surface on the TaskRun, which makes Tekton
+    # treat them as "" and silently skip this task (PipelineRun still Succeeded).
+    - name: provision-cluster
+      runAfter:
+        - build-image-content-sources
+      when:
+        - input: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
+          operator: notin
+          values: [""]
+      params:
+        - name: imageContentSources
+          value: "$(tasks.build-image-content-sources.results.imageContentSources)"
+      taskSpec:
+        params:
+          - name: imageContentSources
+            type: string
+        results:
+          - name: clusterName
+            value: "$(steps.create-cluster.results.clusterName)"
+        steps:
+          - name: get-latest-version-tag
+            ref:
+              resolver: git
+              params:
+                - name: url
+                  value: https://github.com/konflux-ci/build-definitions.git
+                - name: revision
+                  value: main
+                - name: pathInRepo
+                  value: stepactions/eaas-get-latest-openshift-version-by-prefix/0.1/eaas-get-latest-openshift-version-by-prefix.yaml
+            params:
+              - name: prefix
+                value: "$(tasks.pick-cluster-params.results.ocpVersion)"
+
           - name: create-cluster
             ref:
               resolver: git
@@ -401,9 +416,6 @@ spec:
                   value: main
                 - name: pathInRepo
                   value: stepactions/eaas-create-ephemeral-cluster-hypershift-aws/0.1/eaas-create-ephemeral-cluster-hypershift-aws.yaml
-            volumeMounts:
-              - name: ics-data
-                mountPath: /ics
             params:
               - name: eaasSpaceSecretRef
                 value: $(tasks.provision-eaas-space.results.secretRef)
@@ -411,11 +423,10 @@ spec:
                 value: "$(steps.get-latest-version-tag.results.version)"
               - name: instanceType
                 value: "$(tasks.pick-cluster-params.results.bundleArch)"
-              # Fixed path written by build-image-content-sources (empty file = no mirrors)
-              - name: imageContentSourcesFile
-                value: "/ics/image-content-sources.yaml"
+              - name: imageContentSources
+                value: "$(params.imageContentSources)"
 
-    # ── 6. Deploy Operator + Operands + Run Certsuite ──────────────────
+    # ── 7. Deploy Operator + Operands + Run Certsuite ──────────────────
     - name: deploy-and-test
       runAfter:
         - provision-cluster
