@@ -33,7 +33,7 @@ spec:
     #   value: "https://github.com/<REPLACE:org>/<REPLACE:repo>.git@<REPLACE:branch>#.tekton/images-mirror-set.yaml"
     #
     # Optional:
-    # - CERTSUITE_LABELS: default "common"
+    # - CERTSUITE_LABELS: default "common,telco" (add "extended"/"preflight" as needed)
     # - PACKAGE_NAME / CHANNEL_NAME: auto-detected from FBC when empty
     # - OCI_PUSH_SECRET: Quay push secret for certsuite results
   resolverRef:

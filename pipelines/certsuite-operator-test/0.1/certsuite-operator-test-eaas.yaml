@@ -29,9 +29,10 @@ spec:
           https://github.com/org/repo.git@fix/my-branch#tests/my-bundle
     - name: CERTSUITE_LABELS
       type: string
-      default: "common"
+      default: "common,telco"
       description: |
-        Comma-separated certsuite test labels (e.g. "networking,lifecycle").
+        Comma-separated certsuite test labels (e.g. "common,telco").
+        Default covers common + telco checks (recommended for CNF/PTP operators).
     - name: PACKAGE_NAME
       type: string
       default: ""
@@ -755,12 +756,16 @@ spec:
                   oc label csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
                     "redhat-best-practices-for-k8s.com/operator=target" --overwrite 2>&1
 
-                  DS_NAMES=$(oc get daemonsets -n "${INSTALL_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-                  for DS in ${DS_NAMES}; do
-                    echo "[$(date -u +%FT%T.%3NZ)] Patching DaemonSet ${DS} with certsuite labels..."
-                    oc patch daemonset "${DS}" -n "${INSTALL_NAMESPACE}" --type=merge \
-                      -p '{"spec":{"template":{"metadata":{"labels":{"redhat-best-practices-for-k8s.com/generic":"target"}}}}}' 2>&1
-                    oc rollout status daemonset/"${DS}" -n "${INSTALL_NAMESPACE}" --timeout=120s 2>&1 || true
+                  # Initial discovery labels (may be reconciled away by the operator;
+                  # re-applied after operands and again immediately before certsuite).
+                  LABEL_PATCH='{"spec":{"template":{"metadata":{"labels":{"redhat-best-practices-for-k8s.com/generic":"target"}}}}}'
+                  for KIND in daemonset deployment; do
+                    NAMES=$(oc get "${KIND}" -n "${INSTALL_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+                    for NAME in ${NAMES}; do
+                      echo "[$(date -u +%FT%T.%3NZ)] Patching ${KIND}/${NAME} with certsuite labels..."
+                      oc patch "${KIND}" "${NAME}" -n "${INSTALL_NAMESPACE}" --type=merge -p "${LABEL_PATCH}" 2>&1 || true
+                      oc rollout status "${KIND}/${NAME}" -n "${INSTALL_NAMESPACE}" --timeout=120s 2>&1 || true
+                    done
                   done
 
                   exit 0
@@ -855,6 +860,29 @@ spec:
                 oc rollout status "deployment/${DEP}" -n "${TARGET_NS}" --timeout=300s || true
               done
 
+              # Re-apply certsuite discovery labels after operands. Operators that
+              # reconcile DaemonSet/Deployment templates (e.g. PTP) often wipe the
+              # earlier CSV-time patch; without these labels certsuite falls back
+              # to weaker operand autodiscovery and misses Deployments.
+              LABEL_PATCH='{"spec":{"template":{"metadata":{"labels":{"redhat-best-practices-for-k8s.com/generic":"target"}}}}}'
+              for KIND in daemonset deployment; do
+                NAMES=$(oc get "${KIND}" -n "${TARGET_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+                for NAME in ${NAMES}; do
+                  echo "[$(date -u +%FT%T.%3NZ)] Re-patching ${KIND}/${NAME} with certsuite labels..."
+                  oc patch "${KIND}" "${NAME}" -n "${TARGET_NS}" --type=merge -p "${LABEL_PATCH}" 2>&1 || true
+                  oc rollout status "${KIND}/${NAME}" -n "${TARGET_NS}" --timeout=180s 2>&1 || true
+                done
+              done
+
+              LABELED_PODS=$(oc get pods -n "${TARGET_NS}" \
+                -l redhat-best-practices-for-k8s.com/generic=target \
+                --no-headers 2>/dev/null | wc -l | tr -d ' ')
+              echo "[$(date -u +%FT%T.%3NZ)] Pods with certsuite generic=target label: ${LABELED_PODS}"
+              if [[ "${LABELED_PODS}" -eq 0 ]]; then
+                echo "WARNING: No pods have redhat-best-practices-for-k8s.com/generic=target" >&2
+                echo "  Operator may be reconciling template labels away. Certsuite will rely on CSV/operand autodiscovery." >&2
+              fi
+
               echo "[$(date -u +%FT%T.%3NZ)] Operand deployment complete"
 
           # ── Step 4: Run certsuite ────────────────────────────────────
@@ -902,6 +930,7 @@ spec:
               IFS=',' read -ra LABELS <<< "${CERTSUITE_LABELS}"
               for LABEL in "${LABELS[@]}"; do
                 LABEL=$(echo "${LABEL}" | xargs)
+                [[ -z "${LABEL}" ]] && continue
                 SUITE_DIR="${RESULTS_DIR}/${LABEL}"
                 mkdir -p "${SUITE_DIR}"
 
