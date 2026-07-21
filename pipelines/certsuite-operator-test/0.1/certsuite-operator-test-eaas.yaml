@@ -678,7 +678,10 @@ spec:
               done
               echo "[$(date -u +%FT%T.%3NZ)] CatalogSource ${CATSRC} READY"
 
-              # ── Subscription (Manual so we can patch Hypershift CSV constraints)
+              # ── Subscription (Automatic). IDMS handles image pulls; we still
+              # wait for the CSV, apply optional HyperShift field patches, then
+              # wait for Succeeded. Manual approval was mainly needed when the
+              # pipeline rewrote CSV image refs before IDMS.
               SUB=$(oc create -f - -o jsonpath='{.metadata.name}' <<SUB_EOF
               apiVersion: operators.coreos.com/v1alpha1
               kind: Subscription
@@ -687,30 +690,13 @@ spec:
                 namespace: ${INSTALL_NAMESPACE}
               spec:
                 channel: ${CHANNEL_NAME}
-                installPlanApproval: Manual
+                installPlanApproval: Automatic
                 name: ${PACKAGE_NAME}
                 source: ${CATSRC}
                 sourceNamespace: ${INSTALL_NAMESPACE}
                 startingCSV: ${BUNDLE_NAME}
               SUB_EOF
               )
-
-              echo "[$(date -u +%FT%T.%3NZ)] Waiting for InstallPlan..."
-              IP=""
-              for i in $(seq 1 60); do
-                IP=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
-                  -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || echo "")
-                [[ -n "${IP}" ]] && break
-                sleep 5
-              done
-              if [[ -z "${IP}" ]]; then
-                echo "ERROR: No InstallPlan created" >&2
-                oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
-                exit 1
-              fi
-              echo "[$(date -u +%FT%T.%3NZ)] Approving InstallPlan ${IP}..."
-              oc patch installplan "${IP}" -n "${INSTALL_NAMESPACE}" \
-                --type merge -p '{"spec":{"approved":true}}' 2>&1
 
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for OLM to create CSV..."
               CSV=""
@@ -728,7 +714,7 @@ spec:
               if [[ -z "${CSV}" ]]; then
                 echo "ERROR: OLM did not create CSV" >&2
                 oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
-                oc get installplan "${IP}" -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
+                oc get installplan -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
                 exit 1
               fi
               echo "[$(date -u +%FT%T.%3NZ)] CSV created: ${CSV}"
