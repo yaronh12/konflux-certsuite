@@ -719,14 +719,33 @@ spec:
               fi
               echo "[$(date -u +%FT%T.%3NZ)] CSV created: ${CSV}"
 
-              # Hypershift-only CSV fixes (not image-related — IDMS handles pulls)
-              echo "[$(date -u +%FT%T.%3NZ)] Patching CSV for Hypershift constraints..."
+              # Hypershift-only CSV fixes (not image-related — IDMS handles pulls).
+              # Inspect first: skip replace when the CSV already has neither field.
               CSV_JSON=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o json)
-              CSV_JSON=$(echo "${CSV_JSON}" | jq 'del(.spec.minKubeVersion)')
-              CSV_JSON=$(echo "${CSV_JSON}" | jq '
-                (.spec.install.spec.deployments[]?.spec.template.spec.nodeSelector) |=
-                  (if . then del(.["node-role.kubernetes.io/master"]) else . end)')
-              echo "${CSV_JSON}" | oc replace -f - 2>&1
+              echo "[$(date -u +%FT%T.%3NZ)] Pre-patch CSV Hypershift fields:"
+              echo "${CSV_JSON}" | jq '{
+                minKubeVersion: .spec.minKubeVersion,
+                deployments: [
+                  .spec.install.spec.deployments[]?
+                  | {name: .name, nodeSelector: .spec.template.spec.nodeSelector}
+                ]
+              }'
+              NEED_MINKUBE=$(echo "${CSV_JSON}" | jq -r 'if .spec.minKubeVersion then "yes" else "no" end')
+              NEED_MASTER_NS=$(echo "${CSV_JSON}" | jq -r '
+                [.spec.install.spec.deployments[]?
+                  | .spec.template.spec.nodeSelector["node-role.kubernetes.io/master"] // empty]
+                | if length > 0 then "yes" else "no" end')
+              echo "[$(date -u +%FT%T.%3NZ)] Hypershift CSV patch needed? minKubeVersion=${NEED_MINKUBE} masterNodeSelector=${NEED_MASTER_NS}"
+              if [[ "${NEED_MINKUBE}" == "yes" || "${NEED_MASTER_NS}" == "yes" ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] Patching CSV for Hypershift constraints..."
+                CSV_JSON=$(echo "${CSV_JSON}" | jq 'del(.spec.minKubeVersion)')
+                CSV_JSON=$(echo "${CSV_JSON}" | jq '
+                  (.spec.install.spec.deployments[]?.spec.template.spec.nodeSelector) |=
+                    (if . then del(.["node-role.kubernetes.io/master"]) else . end)')
+                echo "${CSV_JSON}" | oc replace -f - 2>&1
+              else
+                echo "[$(date -u +%FT%T.%3NZ)] Skipping Hypershift CSV patch (fields absent)"
+              fi
 
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for CSV phase=Succeeded..."
               for i in $(seq 1 120); do
